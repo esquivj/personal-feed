@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, useMemo, type FormEvent } from "react";
+import { useSync } from "../hooks/useSync";
 
 interface FeedItem {
   title: string;
@@ -1288,6 +1289,7 @@ export default function Home() {
   // Summary panel state
   const [showPanel, setShowPanel] = useState(false);
   const [summaries, setSummaries] = useState<Record<string, AISummary>>({});
+  const { syncing: dbSyncing, error: dbError } = useSync();
 
   const allFeeds = useMemo(
     () => buildRuntimeFeeds(feedEnabledById, customFeeds),
