@@ -149,3 +149,32 @@ export interface DbUserAction {
   created_at: string;
   metadata_json: string | null;
 }
+
+export interface DbMetadata {
+  key: string;
+  value: string | null;
+}
+
+export interface DbItemUpsertInput {
+  source_id: string;
+  title: string;
+  url: string;
+  author?: string | null;
+  published_at?: string | null;
+  content_md?: string | null;
+  content_text?: string | null;
+  summary?: string | null;
+  score?: number;
+  status?: ItemStatus;
+  acted_at?: string | null;
+}
+
+export interface DbSourceUpsertInput {
+  id: string;
+  name: string;
+  url: string;
+  type: SourceType;
+  category: Category;
+  enabled?: boolean;
+  added_at?: string;
+}

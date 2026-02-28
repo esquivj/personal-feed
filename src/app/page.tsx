@@ -1,6 +1,7 @@
 "use client";
 
 import { useEffect, useState, useCallback, useRef, useMemo, type FormEvent } from "react";
+import { useDbItems } from "../hooks/useDbItems";
 import { useSync } from "../hooks/useSync";
 
 interface FeedItem {
@@ -41,6 +42,10 @@ interface CustomFeedSource {
 
 const CATEGORIES = ["Crypto", "Marketing"] as const;
 type Category = (typeof CATEGORIES)[number];
+
+function isPrimaryCategory(value: string): value is Category {
+  return CATEGORIES.includes(value as Category);
+}
 
 interface AISummary {
   tldr: string;
@@ -1228,10 +1233,6 @@ ${content}`,
 }
 
 export default function Home() {
-  const [items, setItems] = useState<FeedItem[]>([]);
-  const [loading, setLoading] = useState(true);
-  const [error, setError] = useState<string | null>(null);
-  const [lastUpdated, setLastUpdated] = useState<Date | null>(null);
   const [selectedIndex, setSelectedIndex] = useState(0);
   const [selectedLink, setSelectedLink] = useState<string | null>(null);
   const [activeCategory, setActiveCategory] = useState<Category>(CATEGORIES[0]);
@@ -1246,8 +1247,6 @@ export default function Home() {
   const [triageByLink, setTriageByLink] = useState<Record<string, ItemTriageState>>({});
   const [savedViews, setSavedViews] = useState<SavedSourceView[]>([]);
   const [feedHealth, setFeedHealth] = useState<Record<string, SourceHealth>>({});
-  const [sourceProfiles, setSourceProfiles] = useState<Record<string, SourceProfile>>({});
-  const [isHydratingProfiles, setIsHydratingProfiles] = useState(false);
   const [settingsHydrated, setSettingsHydrated] = useState(false);
   const [newFeedUrl, setNewFeedUrl] = useState("");
   const [newFeedName, setNewFeedName] = useState("");
@@ -1255,7 +1254,6 @@ export default function Home() {
   const [isAddingFeed, setIsAddingFeed] = useState(false);
   const [addFeedError, setAddFeedError] = useState<string | null>(null);
   const [addFeedSuccess, setAddFeedSuccess] = useState<string | null>(null);
-  const [feedIssues, setFeedIssues] = useState<FeedFetchIssue[]>([]);
   const [mainScrollIndicator, setMainScrollIndicator] = useState<ScrollIndicator>({
     visible: false,
     top: 0,
@@ -1269,9 +1267,6 @@ export default function Home() {
   const mainScrollRef = useRef<HTMLElement>(null);
   const panelScrollRef = useRef<HTMLDivElement>(null);
   const listRef = useRef<HTMLUListElement>(null);
-  const hasLoadedRef = useRef(false);
-  const fetchRunIdRef = useRef(0);
-  const isFetchingRef = useRef(false);
   const summariesRef = useRef<Record<string, AISummary>>({});
   const mainScrollIndicatorRef = useRef<ScrollIndicator>({
     visible: false,
@@ -1290,6 +1285,19 @@ export default function Home() {
   const [showPanel, setShowPanel] = useState(false);
   const [summaries, setSummaries] = useState<Record<string, AISummary>>({});
   const { syncing: dbSyncing, error: dbError } = useSync();
+  const {
+    items: dbItems,
+    loading: dbItemsLoading,
+    error: dbItemsError,
+    lastUpdated,
+    refresh: refreshDbItems,
+  } = useDbItems();
+  const items = useMemo(
+    () => dbItems.filter((item): item is FeedItem => isPrimaryCategory(item.category)),
+    [dbItems]
+  );
+  const loading = dbItemsLoading || dbSyncing;
+  const error = dbItemsError ?? dbError;
 
   const allFeeds = useMemo(
     () => buildRuntimeFeeds(feedEnabledById, customFeeds),
@@ -1510,10 +1518,7 @@ export default function Home() {
     });
     return counts;
   }, [sourceFilteredItems, triageByLink]);
-  const categoryIssues = useMemo(
-    () => feedIssues.filter((issue) => issue.category === activeCategory),
-    [feedIssues, activeCategory]
-  );
+  const categoryIssues: FeedFetchIssue[] = [];
   const categoryCounts = useMemo(() => {
     const counts = new Map<Category, number>();
     for (const item of items) {
@@ -1550,10 +1555,6 @@ export default function Home() {
 
     return counts;
   }, [allFeeds, feedHealth]);
-  const missingProfileFeeds = useMemo(
-    () => settingsFeeds.filter((feed) => !sourceProfiles[feed.id]),
-    [settingsFeeds, sourceProfiles]
-  );
   const savedViewsForCategory = useMemo(
     () => savedViews.filter((view) => view.category === activeCategory),
     [activeCategory, savedViews]
@@ -1750,12 +1751,6 @@ export default function Home() {
       delete next[feedId];
       return next;
     });
-    setSourceProfiles((prev) => {
-      if (!(feedId in prev)) return prev;
-      const next = { ...prev };
-      delete next[feedId];
-      return next;
-    });
   }, []);
 
   const handleAddFeed = useCallback(
@@ -1811,176 +1806,34 @@ export default function Home() {
 
   const fetchFeeds = useCallback(async () => {
     if (!settingsHydrated) return;
-    if (isFetchingRef.current) return;
-    isFetchingRef.current = true;
-    const runId = ++fetchRunIdRef.current;
+    if (dbSyncing) return;
 
     setIsRefreshing(true);
-    if (!hasLoadedRef.current) setLoading(true);
-    setError(null);
-
     try {
-      if (!sourcesGloballyEnabled || activeFeeds.length === 0) {
-        if (runId !== fetchRunIdRef.current) return;
-        const checkedAt = new Date().toISOString();
-        setItems([]);
-        setFeedIssues([]);
-        setLastUpdated(new Date());
-        setFeedHealth((prev) => {
-          const next = { ...prev };
-          allFeeds.forEach((feed) => {
-            const existing = next[feed.id];
-            next[feed.id] = {
-              status: !sourcesGloballyEnabled || !feed.enabled ? "disabled" : "idle",
-              lastCheckedAt: checkedAt,
-              lastSuccessAt: existing?.lastSuccessAt,
-              lastError: existing?.lastError,
-              failureCount: existing?.failureCount ?? 0,
-              lastItemsCount: 0,
-              latencyMs: existing?.latencyMs,
-            };
-          });
-          return next;
-        });
-        return;
-      }
-
-      const results = await Promise.all(activeFeeds.map((feed) => fetchFeedWithRetry(feed)));
-      if (runId !== fetchRunIdRef.current) return;
-
-      const allItems = normalizeFeedItems(results.flatMap((result) => result.items));
-      const issues = results
-        .map((result) => result.issue)
-        .filter((issue): issue is FeedFetchIssue => Boolean(issue));
-      const resultByFeedId = new Map(results.map((result) => [result.feedId, result]));
-      setItems(allItems);
-      setFeedIssues(issues);
-      setLastUpdated(new Date());
+      await refreshDbItems();
+      const checkedAt = new Date().toISOString();
       setFeedHealth((prev) => {
         const next = { ...prev };
         allFeeds.forEach((feed) => {
-          if (!feed.enabled || !sourcesGloballyEnabled) {
-            const existing = next[feed.id];
-            next[feed.id] = {
-              status: "disabled",
-              lastCheckedAt: existing?.lastCheckedAt,
-              lastSuccessAt: existing?.lastSuccessAt,
-              lastError: existing?.lastError,
-              failureCount: existing?.failureCount ?? 0,
-              lastItemsCount: 0,
-              latencyMs: existing?.latencyMs,
-            };
-            return;
-          }
-
-          const result = resultByFeedId.get(feed.id);
           const existing = next[feed.id];
-          if (!result) {
-            next[feed.id] = {
-              status: existing?.status || "idle",
-              lastCheckedAt: existing?.lastCheckedAt,
-              lastSuccessAt: existing?.lastSuccessAt,
-              lastError: existing?.lastError,
-              failureCount: existing?.failureCount ?? 0,
-              lastItemsCount: existing?.lastItemsCount ?? 0,
-              latencyMs: existing?.latencyMs,
-            };
-            return;
-          }
-
-          if (result.issue) {
-            next[feed.id] = {
-              status: "error",
-              lastCheckedAt: result.checkedAt,
-              lastSuccessAt: existing?.lastSuccessAt,
-              lastError: result.issue.message,
-              failureCount: (existing?.failureCount ?? 0) + 1,
-              lastItemsCount: 0,
-              latencyMs: result.latencyMs,
-            };
-            return;
-          }
-
           next[feed.id] = {
-            status: "healthy",
-            lastCheckedAt: result.checkedAt,
-            lastSuccessAt: result.checkedAt,
+            status: !sourcesGloballyEnabled || !feed.enabled ? "disabled" : "idle",
+            lastCheckedAt: checkedAt,
+            lastSuccessAt: existing?.lastSuccessAt,
             lastError: undefined,
-            failureCount: 0,
-            lastItemsCount: result.items.length,
-            latencyMs: result.latencyMs,
+            failureCount: existing?.failureCount ?? 0,
+            lastItemsCount: existing?.lastItemsCount ?? 0,
+            latencyMs: existing?.latencyMs,
           };
         });
         return next;
       });
-
-      if (allItems.length === 0 && issues.length > 0) {
-        setError("Failed to load feeds. Check source errors.");
-      }
     } catch (e) {
-      if (runId !== fetchRunIdRef.current) return;
-      console.error("Feed fetch error:", e);
-      setError("Failed to load feeds");
-      setFeedIssues([]);
+      console.error("Local DB refresh error:", e);
     } finally {
-      if (runId === fetchRunIdRef.current) {
-        setLoading(false);
-        setIsRefreshing(false);
-        hasLoadedRef.current = true;
-      }
-      isFetchingRef.current = false;
+      setIsRefreshing(false);
     }
-  }, [activeFeeds, allFeeds, settingsHydrated, sourcesGloballyEnabled]);
-
-  useEffect(() => {
-    if (!showSettings || missingProfileFeeds.length === 0) {
-      return;
-    }
-
-    let cancelled = false;
-    setIsHydratingProfiles(true);
-
-    (async () => {
-      try {
-        const profiles = await Promise.all(
-          missingProfileFeeds.map(async (feed) => {
-            try {
-              const content = await withTimeout(
-                fetchWithTauri(feed.url),
-                FEED_TIMEOUT_MS,
-                feed.source
-              );
-              return {
-                feedId: feed.id,
-                profile: await extractSourceProfileFromContent(content, feed),
-              };
-            } catch {
-              return {
-                feedId: feed.id,
-                profile: buildFallbackSourceProfile(feed),
-              };
-            }
-          })
-        );
-
-        if (cancelled) return;
-        setSourceProfiles((prev) => {
-          const next = { ...prev };
-          profiles.forEach(({ feedId, profile }) => {
-            next[feedId] = profile;
-          });
-          return next;
-        });
-      } finally {
-        if (!cancelled) setIsHydratingProfiles(false);
-      }
-    })();
-
-    return () => {
-      cancelled = true;
-      setIsHydratingProfiles(false);
-    };
-  }, [missingProfileFeeds, showSettings]);
+  }, [allFeeds, dbSyncing, refreshDbItems, settingsHydrated, sourcesGloballyEnabled]);
 
   // Keyboard navigation
   useEffect(() => {
@@ -2355,14 +2208,14 @@ export default function Home() {
               </button>
               <button
                 onClick={fetchFeeds}
-                disabled={isRefreshing || !settingsHydrated}
+                disabled={isRefreshing || dbSyncing || !settingsHydrated}
                 className="inline-flex h-8 w-8 items-center justify-center rounded-md border border-[#27272a] bg-[#111114] text-[#71717a] hover:text-[#fafafa] hover:border-[#3f3f46] transition-colors disabled:opacity-50"
                 aria-label="Refresh feed"
-                title={isRefreshing ? "Refreshing" : "Refresh feed"}
+                title={isRefreshing || dbSyncing ? "Refreshing" : "Refresh feed"}
               >
                 <RefreshIcon
                   className={`h-5 w-5 ${
-                    isRefreshing ? "animate-spin" : ""
+                    isRefreshing || dbSyncing ? "animate-spin" : ""
                   }`}
                 />
               </button>
@@ -2924,14 +2777,18 @@ export default function Home() {
                   </button>
                   <button
                     onClick={fetchFeeds}
-                    disabled={isRefreshing}
+                    disabled={isRefreshing || dbSyncing}
                     className="inline-flex h-8 w-8 items-center justify-center rounded-md bg-[#18181b] text-[#a1a1aa] hover:text-[#fafafa] transition-colors disabled:opacity-50"
                     aria-label="Refresh source health"
-                    title={isRefreshing ? "Refreshing source health" : "Refresh source health"}
+                    title={
+                      isRefreshing || dbSyncing
+                        ? "Refreshing source health"
+                        : "Refresh source health"
+                    }
                   >
                     <RefreshIcon
                       className={`h-5 w-5 ${
-                        isRefreshing ? "animate-spin" : ""
+                        isRefreshing || dbSyncing ? "animate-spin" : ""
                       }`}
                     />
                   </button>
@@ -3004,16 +2861,11 @@ export default function Home() {
                   <p className="text-[11px] text-[#52525b] mt-1">
                     Publication context, pull endpoint, and essential source controls
                   </p>
-                  {isHydratingProfiles && (
-                    <p className="text-[10px] text-[#71717a] mt-1">
-                      Scraping publication descriptions...
-                    </p>
-                  )}
                 </div>
                 <div className="space-y-2">
                   {settingsFeeds.map((feed) => {
                     const health = feedHealth[feed.id];
-                    const profile = sourceProfiles[feed.id];
+                    const profile = buildFallbackSourceProfile(feed);
                     const status: SourceHealthStatus =
                       !sourcesGloballyEnabled || !feed.enabled
                         ? "disabled"
@@ -3038,10 +2890,10 @@ export default function Home() {
                               )}
                             </div>
                             <p className="text-[11px] text-[#a1a1aa] leading-relaxed">
-                              {profile?.about || buildFallbackSourceProfile(feed).about}
+                              {profile.about}
                             </p>
                             <p className="text-[10px] text-[#71717a] leading-relaxed">
-                              {profile?.pulling || buildPullingSummary(feed)}
+                              {profile.pulling}
                             </p>
                             <p className="text-[10px] text-[#52525b]">
                               checked {formatShortDateTime(health?.lastCheckedAt)}
